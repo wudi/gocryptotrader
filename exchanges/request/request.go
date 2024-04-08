@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"sync/atomic"
 	"time"
 
 	"github.com/thrasher-corp/gocryptotrader/common"
@@ -40,7 +39,6 @@ var (
 	// ErrAuthRequestFailed is a wrapping error to denote that it's an auth request that failed
 	ErrAuthRequestFailed = errors.New("authenticated request failed")
 
-	errMaxRequestJobs         = errors.New("max request jobs reached")
 	errRequestFunctionIsNil   = errors.New("request function is nil")
 	errRequestItemNil         = errors.New("request item is nil")
 	errInvalidPath            = errors.New("invalid path")
@@ -93,13 +91,7 @@ func (r *Requester) SendPayload(ctx context.Context, ep EndpointLimit, newReques
 		return errRequestFunctionIsNil
 	}
 
-	if atomic.LoadInt32(&r.jobs) >= MaxRequestJobs {
-		return errMaxRequestJobs
-	}
-
-	atomic.AddInt32(&r.jobs, 1)
 	err := r.doRequest(ctx, ep, newRequest)
-	atomic.AddInt32(&r.jobs, -1)
 	if err != nil && requestType == AuthenticatedRequest {
 		err = common.AppendError(err, ErrAuthRequestFailed)
 	}
@@ -179,8 +171,20 @@ func (r *Requester) doRequest(ctx context.Context, endpoint EndpointLimit, newRe
 				log.Debugf(log.RequestSys, "%s request header [%s]: %s", r.name, k, d)
 			}
 			log.Debugf(log.RequestSys, "%s request type: %s", r.name, p.Method)
-			if p.Body != nil {
-				log.Debugf(log.RequestSys, "%s request body: %v", r.name, p.Body)
+			if req.GetBody != nil {
+				bodyCopy, bodyErr := req.GetBody()
+				if bodyErr != nil {
+					return bodyErr
+				}
+				payload, bodyErr := io.ReadAll(bodyCopy)
+				err = bodyCopy.Close()
+				if err != nil {
+					log.Errorf(log.RequestSys, "%s failed to close request body %s", r.name, err)
+				}
+				if bodyErr != nil {
+					return bodyErr
+				}
+				log.Debugf(log.RequestSys, "%s request body: %s", r.name, payload)
 			}
 		}
 

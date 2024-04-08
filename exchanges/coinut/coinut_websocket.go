@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/buger/jsonparser"
 	"github.com/gorilla/websocket"
 	"github.com/thrasher-corp/gocryptotrader/common"
 	"github.com/thrasher-corp/gocryptotrader/common/crypto"
@@ -18,6 +19,7 @@ import (
 	"github.com/thrasher-corp/gocryptotrader/exchanges/order"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/orderbook"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/stream"
+	"github.com/thrasher-corp/gocryptotrader/exchanges/subscription"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/ticker"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/trade"
 	"github.com/thrasher-corp/gocryptotrader/log"
@@ -40,7 +42,7 @@ var (
 // WsConnect initiates a websocket connection
 func (c *COINUT) WsConnect() error {
 	if !c.Websocket.IsEnabled() || !c.IsEnabled() {
-		return errors.New(stream.WebsocketNotEnabled)
+		return stream.ErrWebsocketNotEnabled
 	}
 	var dialer websocket.Dialer
 	err := c.Websocket.Conn.Dial(&dialer, http.Header{})
@@ -57,10 +59,12 @@ func (c *COINUT) WsConnect() error {
 			return err
 		}
 	}
-	err = c.wsAuthenticate(context.TODO())
-	if err != nil {
-		c.Websocket.SetCanUseAuthenticatedEndpoints(false)
-		log.Errorln(log.WebsocketMgr, err)
+
+	if c.IsWebsocketAuthenticationSupported() {
+		if err = c.wsAuthenticate(context.TODO()); err != nil {
+			c.Websocket.SetCanUseAuthenticatedEndpoints(false)
+			log.Errorln(log.WebsocketMgr, c.Name+" "+err.Error())
+		}
 	}
 
 	// define bi-directional communication
@@ -73,6 +77,8 @@ func (c *COINUT) WsConnect() error {
 // wsReadData receives and passes on websocket messages for processing
 func (c *COINUT) wsReadData() {
 	defer c.Websocket.Wg.Done()
+
+	ctx := context.TODO()
 
 	for {
 		resp := c.Websocket.Conn.ReadMessage()
@@ -99,7 +105,7 @@ func (c *COINUT) wsReadData() {
 					c.Websocket.DataHandler <- err
 					continue
 				}
-				err = c.wsHandleData(context.TODO(), individualJSON)
+				err = c.wsHandleData(ctx, individualJSON)
 				if err != nil {
 					c.Websocket.DataHandler <- err
 				}
@@ -111,7 +117,7 @@ func (c *COINUT) wsReadData() {
 				c.Websocket.DataHandler <- err
 				continue
 			}
-			err = c.wsHandleData(context.TODO(), resp.Raw)
+			err = c.wsHandleData(ctx, resp.Raw)
 			if err != nil {
 				c.Websocket.DataHandler <- err
 			}
@@ -119,7 +125,7 @@ func (c *COINUT) wsReadData() {
 	}
 }
 
-func (c *COINUT) wsHandleData(ctx context.Context, respRaw []byte) error {
+func (c *COINUT) wsHandleData(_ context.Context, respRaw []byte) error {
 	if strings.HasPrefix(string(respRaw), "[") {
 		var orders []wsOrderContainer
 		err := json.Unmarshal(respRaw, &orders)
@@ -141,10 +147,8 @@ func (c *COINUT) wsHandleData(ctx context.Context, respRaw []byte) error {
 	if err != nil {
 		return err
 	}
-	if strings.Contains(string(respRaw), "client_ord_id") {
-		if c.Websocket.Match.IncomingWithData(incoming.Nonce, respRaw) {
-			return nil
-		}
+	if c.Websocket.Match.IncomingWithData(incoming.Nonce, respRaw) {
+		return nil
 	}
 
 	format, err := c.GetPairFormat(asset.Spot, true)
@@ -155,27 +159,6 @@ func (c *COINUT) wsHandleData(ctx context.Context, respRaw []byte) error {
 	switch incoming.Reply {
 	case "hb":
 		channels["hb"] <- respRaw
-	case "login":
-		var login WsLoginResponse
-		err := json.Unmarshal(respRaw, &login)
-		if err != nil {
-			return err
-		}
-
-		creds, err := c.GetCredentials(ctx)
-		if err != nil {
-			return err
-		}
-
-		var endpointFailure []byte
-		if login.APIKey != creds.Key {
-			endpointFailure = []byte("failed to authenticate")
-		}
-
-		if c.Websocket.Match.IncomingWithData(login.Nonce, endpointFailure) {
-			return nil
-		}
-
 	case "user_balance":
 		var userBalance WsUserBalanceResponse
 		err := json.Unmarshal(respRaw, &userBalance)
@@ -597,19 +580,19 @@ func (c *COINUT) WsProcessOrderbookUpdate(update *WsOrderbookUpdate) error {
 }
 
 // GenerateDefaultSubscriptions Adds default subscriptions to websocket to be handled by ManageSubscriptions()
-func (c *COINUT) GenerateDefaultSubscriptions() ([]stream.ChannelSubscription, error) {
+func (c *COINUT) GenerateDefaultSubscriptions() ([]subscription.Subscription, error) {
 	var channels = []string{"inst_tick", "inst_order_book", "inst_trade"}
-	var subscriptions []stream.ChannelSubscription
-	enabledCurrencies, err := c.GetEnabledPairs(asset.Spot)
+	var subscriptions []subscription.Subscription
+	enabledPairs, err := c.GetEnabledPairs(asset.Spot)
 	if err != nil {
 		return nil, err
 	}
 	for i := range channels {
-		for j := range enabledCurrencies {
-			subscriptions = append(subscriptions, stream.ChannelSubscription{
-				Channel:  channels[i],
-				Currency: enabledCurrencies[j],
-				Asset:    asset.Spot,
+		for j := range enabledPairs {
+			subscriptions = append(subscriptions, subscription.Subscription{
+				Channel: channels[i],
+				Pair:    enabledPairs[j],
+				Asset:   asset.Spot,
 			})
 		}
 	}
@@ -617,10 +600,10 @@ func (c *COINUT) GenerateDefaultSubscriptions() ([]stream.ChannelSubscription, e
 }
 
 // Subscribe sends a websocket message to receive data from the channel
-func (c *COINUT) Subscribe(channelsToSubscribe []stream.ChannelSubscription) error {
+func (c *COINUT) Subscribe(channelsToSubscribe []subscription.Subscription) error {
 	var errs error
 	for i := range channelsToSubscribe {
-		fPair, err := c.FormatExchangeCurrency(channelsToSubscribe[i].Currency, asset.Spot)
+		fPair, err := c.FormatExchangeCurrency(channelsToSubscribe[i].Pair, asset.Spot)
 		if err != nil {
 			errs = common.AppendError(errs, err)
 			continue
@@ -646,10 +629,10 @@ func (c *COINUT) Subscribe(channelsToSubscribe []stream.ChannelSubscription) err
 }
 
 // Unsubscribe sends a websocket message to stop receiving data from the channel
-func (c *COINUT) Unsubscribe(channelToUnsubscribe []stream.ChannelSubscription) error {
+func (c *COINUT) Unsubscribe(channelToUnsubscribe []subscription.Subscription) error {
 	var errs error
 	for i := range channelToUnsubscribe {
-		fPair, err := c.FormatExchangeCurrency(channelToUnsubscribe[i].Currency, asset.Spot)
+		fPair, err := c.FormatExchangeCurrency(channelToUnsubscribe[i].Pair, asset.Spot)
 		if err != nil {
 			errs = common.AppendError(errs, err)
 			continue
@@ -661,8 +644,7 @@ func (c *COINUT) Unsubscribe(channelToUnsubscribe []stream.ChannelSubscription) 
 			Subscribe:    false,
 			Nonce:        getNonce(),
 		}
-		resp, err := c.Websocket.Conn.SendMessageReturnResponse(subscribe.Nonce,
-			subscribe)
+		resp, err := c.Websocket.Conn.SendMessageReturnResponse(subscribe.Nonce, subscribe)
 		if err != nil {
 			errs = common.AppendError(errs, err)
 			continue
@@ -694,43 +676,31 @@ func (c *COINUT) wsAuthenticate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	timestamp := time.Now().Unix()
-	nonce := getNonce()
-	payload := creds.ClientID + "|" +
-		strconv.FormatInt(timestamp, 10) + "|" +
-		strconv.FormatInt(nonce, 10)
-
-	hmac, err := crypto.GetHMAC(crypto.HashSHA256,
-		[]byte(payload),
-		[]byte(creds.Key))
-	if err != nil {
-		return err
-	}
-
-	loginRequest := struct {
-		Request   string `json:"request"`
-		Username  string `json:"username"`
-		Nonce     int64  `json:"nonce"`
-		Hmac      string `json:"hmac_sha256"`
-		Timestamp int64  `json:"timestamp"`
-	}{
+	r := WsLoginReq{
 		Request:   "login",
 		Username:  creds.ClientID,
-		Nonce:     nonce,
-		Hmac:      crypto.HexEncodeToString(hmac),
-		Timestamp: timestamp,
+		Nonce:     getNonce(),
+		Timestamp: time.Now().Unix(),
 	}
-
-	resp, err := c.Websocket.Conn.SendMessageReturnResponse(loginRequest.Nonce,
-		loginRequest)
+	payload := creds.ClientID + "|" + strconv.FormatInt(r.Timestamp, 10) + "|" + strconv.FormatInt(r.Nonce, 10)
+	hmac, err := crypto.GetHMAC(crypto.HashSHA256, []byte(payload), []byte(creds.Key))
 	if err != nil {
 		return err
 	}
-	if resp != nil {
-		c.Websocket.SetCanUseAuthenticatedEndpoints(false)
-		return fmt.Errorf("%v %s", c.Name, resp)
+	r.Hmac = crypto.HexEncodeToString(hmac)
+
+	resp, err := c.Websocket.Conn.SendMessageReturnResponse(r.Nonce, r)
+	if err != nil {
+		return err
 	}
+
+	respKey, err := jsonparser.GetUnsafeString(resp, "api_key")
+	if err != nil || respKey != creds.Key {
+		return errors.New("failed to authenticate")
+	}
+
 	c.Websocket.SetCanUseAuthenticatedEndpoints(true)
+
 	return nil
 }
 
@@ -742,8 +712,7 @@ func (c *COINUT) wsGetAccountBalance() (*UserBalance, error) {
 		Request: "user_balance",
 		Nonce:   getNonce(),
 	}
-	resp, err := c.Websocket.Conn.SendMessageReturnResponse(accBalance.Nonce,
-		accBalance)
+	resp, err := c.Websocket.Conn.SendMessageReturnResponse(accBalance.Nonce, accBalance)
 	if err != nil {
 		return nil, err
 	}
@@ -779,8 +748,7 @@ func (c *COINUT) wsSubmitOrder(o *WsSubmitOrderParameters) (*order.Detail, error
 	if o.OrderID > 0 {
 		orderSubmissionRequest.OrderID = o.OrderID
 	}
-	resp, err := c.Websocket.Conn.SendMessageReturnResponse(orderSubmissionRequest.Nonce,
-		orderSubmissionRequest)
+	resp, err := c.Websocket.Conn.SendMessageReturnResponse(orderSubmissionRequest.Nonce, orderSubmissionRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -823,8 +791,7 @@ func (c *COINUT) wsSubmitOrders(orders []WsSubmitOrderParameters) ([]order.Detai
 
 	orderRequest.Nonce = getNonce()
 	orderRequest.Request = "new_orders"
-	resp, err := c.Websocket.Conn.SendMessageReturnResponse(orderRequest.Nonce,
-		orderRequest)
+	resp, err := c.Websocket.Conn.SendMessageReturnResponse(orderRequest.Nonce, orderRequest)
 	if err != nil {
 		errs = append(errs, err)
 		return nil, errs
@@ -860,8 +827,7 @@ func (c *COINUT) wsGetOpenOrders(curr string) (*WsUserOpenOrdersResponse, error)
 	openOrdersRequest.Nonce = getNonce()
 	openOrdersRequest.InstrumentID = c.instrumentMap.LookupID(curr)
 
-	resp, err := c.Websocket.Conn.SendMessageReturnResponse(openOrdersRequest.Nonce,
-		openOrdersRequest)
+	resp, err := c.Websocket.Conn.SendMessageReturnResponse(openOrdersRequest.Nonce, openOrdersRequest)
 	if err != nil {
 		return response, err
 	}
@@ -894,8 +860,7 @@ func (c *COINUT) wsCancelOrder(cancellation *WsCancelOrderParameters) (*CancelOr
 	cancellationRequest.OrderID = cancellation.OrderID
 	cancellationRequest.Nonce = getNonce()
 
-	resp, err := c.Websocket.Conn.SendMessageReturnResponse(cancellationRequest.Nonce,
-		cancellationRequest)
+	resp, err := c.Websocket.Conn.SendMessageReturnResponse(cancellationRequest.Nonce, cancellationRequest)
 	if err != nil {
 		return response, err
 	}
@@ -936,8 +901,7 @@ func (c *COINUT) wsCancelOrders(cancellations []WsCancelOrderParameters) (*Cance
 
 	cancelOrderRequest.Request = "cancel_orders"
 	cancelOrderRequest.Nonce = getNonce()
-	resp, err := c.Websocket.Conn.SendMessageReturnResponse(cancelOrderRequest.Nonce,
-		cancelOrderRequest)
+	resp, err := c.Websocket.Conn.SendMessageReturnResponse(cancelOrderRequest.Nonce, cancelOrderRequest)
 	if err != nil {
 		return response, err
 	}
@@ -967,8 +931,7 @@ func (c *COINUT) wsGetTradeHistory(p currency.Pair, start, limit int64) (*WsTrad
 	request.Start = start
 	request.Limit = limit
 
-	resp, err := c.Websocket.Conn.SendMessageReturnResponse(request.Nonce,
-		request)
+	resp, err := c.Websocket.Conn.SendMessageReturnResponse(request.Nonce, request)
 	if err != nil {
 		return response, err
 	}
